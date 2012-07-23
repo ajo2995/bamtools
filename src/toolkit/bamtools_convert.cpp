@@ -15,6 +15,7 @@
 #include <utils/bamtools_options.h>
 #include <utils/bamtools_pileup_engine.h>
 #include <utils/bamtools_utilities.h>
+#include <third_party/snapdragon/BAMConverter.h>
 using namespace BamTools;
 
 #include <fstream>
@@ -37,6 +38,7 @@ static const string FORMAT_JSON   = "json";
 static const string FORMAT_SAM    = "sam";
 static const string FORMAT_PILEUP = "pileup";
 static const string FORMAT_YAML   = "yaml";
+static const string FORMAT_SNAP   = "snap";
 
 // other constants
 static const unsigned int FASTA_LINE_MAX = 50;
@@ -134,7 +136,8 @@ struct ConvertTool::ConvertToolPrivate {
         void PrintJson(const BamAlignment& a);
         void PrintSam(const BamAlignment& a);
         void PrintYaml(const BamAlignment& a);
-        
+        void PrintSnap(const BamAlignment& a);
+		
         // special case - uses the PileupEngine
         bool RunPileupConversion(BamMultiReader* reader);
         
@@ -143,6 +146,7 @@ struct ConvertTool::ConvertToolPrivate {
         ConvertTool::ConvertSettings* m_settings;
         RefVector m_references;
         ostream m_out;
+		Snapdragon::BAMConverter *SnapBam;
 };
 
 bool ConvertTool::ConvertToolPrivate::Run(void) {
@@ -198,16 +202,28 @@ bool ConvertTool::ConvertToolPrivate::Run(void) {
     ofstream outFile;
     if ( m_settings->HasOutput ) {
       
-        // open output file stream
-        outFile.open(m_settings->OutputFilename.c_str());
-        if ( !outFile ) {
-            cerr << "bamtools convert ERROR: could not open " << m_settings->OutputFilename
-                 << " for output" << endl;
-            return false; 
-        }
+	  
+	  	// for Snapdragon, treat Outputfilename as a directory
+		if ( m_settings->Format == FORMAT_SNAP ) {
+			SnapBam = new Snapdragon::BAMConverter(m_settings->OutputFilename);
+			if ( !SnapBam ) {
+				cerr << "bamtools convert ERROR: Snapdragon::BAMConverter(" << m_settings->OutputFilename
+					<< ") failed." << endl;
+				return false;
+			}
+		}
+		else {
+	        // open output file stream
+	        outFile.open(m_settings->OutputFilename.c_str());
+	        if ( !outFile ) {
+	            cerr << "bamtools convert ERROR: could not open " << m_settings->OutputFilename
+	                 << " for output" << endl;
+	            return false; 
+	        }
         
-        // set m_out to file's streambuf
-        m_out.rdbuf(outFile.rdbuf()); 
+	        // set m_out to file's streambuf
+	        m_out.rdbuf(outFile.rdbuf()); 
+		}
     }
     
     // -------------------------------------
@@ -233,6 +249,7 @@ bool ConvertTool::ConvertToolPrivate::Run(void) {
         else if ( m_settings->Format == FORMAT_JSON )  pFunction = &BamTools::ConvertTool::ConvertToolPrivate::PrintJson;
         else if ( m_settings->Format == FORMAT_SAM )   pFunction = &BamTools::ConvertTool::ConvertToolPrivate::PrintSam;
         else if ( m_settings->Format == FORMAT_YAML )  pFunction = &BamTools::ConvertTool::ConvertToolPrivate::PrintYaml;
+		else if ( m_settings->Format == FORMAT_SNAP )  pFunction = &BamTools::ConvertTool::ConvertToolPrivate::PrintSnap;
         else { 
             cerr << "bamtools convert ERROR: unrecognized format: " << m_settings->Format << endl;
             cerr << "Please see documentation for list of supported formats " << endl;
@@ -251,6 +268,10 @@ bool ConvertTool::ConvertToolPrivate::Run(void) {
             BamAlignment a;
             while ( reader.GetNextAlignment(a) )
                 (this->*pFunction)(a);
+
+			if ( m_settings->Format == FORMAT_SNAP ) {
+				SnapBam->writePartition(); // finish last partition
+			}
             
             // set flag for successful conversion
             convertedOk = true;
@@ -652,6 +673,155 @@ void ConvertTool::ConvertToolPrivate::PrintYaml(const BamAlignment& a) {
         m_out << endl;
     }
 }
+
+// print BamAlignment in Snapdragon's BAM format
+void ConvertTool::ConvertToolPrivate::PrintSnap(const BamAlignment& a) {
+
+	// check if we're starting a new chromosome (or unaligned)
+	if (a.RefID != SnapBam->RefID) {
+		SnapBam->writePartition();
+		string RefName = "unaligned";
+	    if ( (a.RefID >= 0) && (a.RefID < (int)m_references.size()) ) 
+	        RefName = m_references[a.RefID].RefName;
+		SnapBam->newPartition(a.RefID,RefName);
+	}
+  
+	SnapBam->insert("QNAME", a.Name);
+	SnapBam->insert("FLAG", a.AlignmentFlag);
+    SnapBam->insert("POS", a.Position);
+	SnapBam->insert("MAPQ", a.MapQuality);
+    
+    // write CIGAR
+	stringstream cigarSS;
+    const vector<CigarOp>& cigarData = a.CigarData;
+    if ( cigarData.empty() ) cigarSS << "*";
+    else {
+        vector<CigarOp>::const_iterator cigarIter = cigarData.begin();
+        vector<CigarOp>::const_iterator cigarEnd  = cigarData.end();
+        for ( ; cigarIter != cigarEnd; ++cigarIter ) {
+            const CigarOp& op = (*cigarIter);
+            cigarSS << op.Length << op.Type;
+        }
+    }
+	SnapBam->insert("CIGAR", cigarSS.str());
+    
+    // write mate reference name, mate position, & insert size
+    if ( a.IsPaired() && (a.MateRefID >= 0) && (a.MateRefID < (int)m_references.size()) ) {
+        if ( a.MateRefID == a.RefID )
+            SnapBam->insert("MRNM", "=");
+        else
+            SnapBam->insert("MRNM", m_references[a.MateRefID].RefName);
+        SnapBam->insert("MPOS", a.MatePosition);
+		SnapBam->insert("ISIZE", a.InsertSize);
+    }
+    else {
+    	SnapBam->insert("MRNM", "*");
+		SnapBam->insert("MPOS", 0);
+		SnapBam->insert("ISIZE", 0);
+    }
+    
+    // write sequence
+    if ( a.QueryBases.empty() )
+        SnapBam->insert("SEQ", "*");
+    else
+        SnapBam->insert("SEQ", a.QueryBases);
+    
+    // write qualities
+    if ( a.Qualities.empty() || (a.Qualities.at(0) == (char)0xFF) )
+        SnapBam->insert("QUAL", "*");
+    else
+        SnapBam->insert("QUAL", a.Qualities);
+    
+    // write tag data
+    const char* tagData = a.TagData.c_str();
+    const size_t tagDataLength = a.TagData.length();
+    
+	// need a hash to keep track of the number of times we've seen each tag
+	map<string,int> tagTally;
+    size_t index = 0;
+    while ( index < tagDataLength ) {
+
+        string tagName = a.TagData.substr(index, 2);
+		if (tagTally[tagName] != 0)
+			tagTally[tagName]++;
+		else
+			tagTally.insert(pair<string,int>(tagName,1));
+
+		tagName += "_" + tagTally[tagName];
+
+        index += 2;
+        
+        // get data type
+        char type = a.TagData.at(index);
+        ++index;
+        switch ( type ) {
+            case (Constants::BAM_TAG_TYPE_ASCII) :
+				SnapBam->setType(tagName, unsigned char);
+				SnapBam->insert(tagName, tagData[index]);
+                ++index;
+                break;
+
+            case (Constants::BAM_TAG_TYPE_INT8)  :
+				SnapBam->setType(tagName, char);
+				SnapBam->insert(tagName, tagData[index]);
+				++index;
+				break;
+            case (Constants::BAM_TAG_TYPE_UINT8) :
+				SnapBam->setType(tagName, unsigned char);
+				SnapBam->insert(tagName, tagData[index]);
+                ++index;
+                break;
+
+            case (Constants::BAM_TAG_TYPE_INT16) :
+				SnapBam->setType(tagName, int16_t);
+				SnapBam->insert(tagName, tagData[index]);
+                index += sizeof(int16_t);
+                break;
+
+            case (Constants::BAM_TAG_TYPE_UINT16) :
+				SnapBam->setType(tagName, uint16_t);
+				SnapBam->insert(tagName, tagData[index]);
+                index += sizeof(uint16_t);
+                break;
+
+            case (Constants::BAM_TAG_TYPE_INT32) :
+				SnapBam->setType(tagName, int32_t);
+				SnapBam->insert(tagName, tagData[index]);
+                index += sizeof(int32_t);
+                break;
+
+            case (Constants::BAM_TAG_TYPE_UINT32) :
+				SnapBam->setType(tagName, uint32_t);
+				SnapBam->insert(tagName, tagData[index]);
+                index += sizeof(uint32_t);
+                break;
+
+            case (Constants::BAM_TAG_TYPE_FLOAT) :
+				SnapBam->setType(tagName, float);
+				SnapBam->insert(tagName, tagData[index]);
+                index += sizeof(float);
+                break;
+
+            case (Constants::BAM_TAG_TYPE_HEX)    :
+            case (Constants::BAM_TAG_TYPE_STRING) :
+				stringstream tagss;
+                while (tagData[index]) {
+                    tagss << tagData[index];
+                    ++index;
+                }
+				SnapBam->setType(tagName, string);
+				SnapBam->insert(tagName, tagss.str());
+                ++index;
+                break;
+        }
+
+        if ( tagData[index] == '\0') 
+            break;
+    }
+
+    m_out << endl;
+}
+
 
 bool ConvertTool::ConvertToolPrivate::RunPileupConversion(BamMultiReader* reader) {
   
